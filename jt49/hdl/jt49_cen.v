@@ -1,15 +1,12 @@
 /*  This file is part of JT49.
-
     JT49 is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
-
     JT49 is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
-
     You should have received a copy of the GNU General Public License
     along with JT49.  If not, see <http://www.gnu.org/licenses/>.
     
@@ -29,6 +26,7 @@ module jt49_cen(
     output  cen16,
     output  cen256
 );
+parameter CLKDIV = 3; // use 3 for standalone JT49 or 2
 
 reg [9:0] cencnt;
 
@@ -38,8 +36,8 @@ always @(posedge clk, negedge rst_n)
     else if(cen)
         cencnt <= cencnt+10'd1;
 
-wire toggle16 = sel ? cencnt[2:0]==3'd0 : cencnt[3:0]==4'd0;
-wire toggle256= sel ? cencnt[6:0]==7'd0 : cencnt[7:0]==8'd0;
+wire toggle16 = sel ? !cencnt[CLKDIV-1:0] : !cencnt[CLKDIV:0];
+wire toggle256= sel ? cencnt[6:0]==7'd0   : cencnt[7:0]==8'd0;
 
 assign cen16  = cen & toggle16;
 assign cen256 = cen & toggle256;

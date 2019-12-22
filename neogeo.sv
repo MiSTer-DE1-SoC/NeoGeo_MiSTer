@@ -178,7 +178,7 @@ assign AUDIO_MIX = status[5:4];
 assign AUDIO_L = snd_left;
 assign AUDIO_R = snd_right;
 
-assign LED_USER  = status[0];
+assign LED_USER  = status[0] | bk_pending;
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
 assign BUTTONS   = osd_btn;
@@ -191,8 +191,8 @@ assign VIDEO_ARY = status[17] ? 8'd9  : 8'd7;	// 224/32
 // --AA-PSS -------- L--CGGDD DEEMVTTR
 //  :	status[0]		System Reset, used by the HPS, keep it there
 // T:	status[2:1]		System type, 0=Console, 1=Arcade, 2=CD, 3=CDZ
-// V: status[3]		Video mode
-// M: status[4]		Memory card presence
+// V:	status[3]		Video mode
+// M:	status[4]		Memory card presence
 // E:	status[6:5]		Stereo mix
 // D:	status[9:7]		DIP switches
 // G:	status[11:10]	Neo CD region
@@ -201,6 +201,7 @@ assign VIDEO_ARY = status[17] ? 8'd9  : 8'd7;	// 224/32
 //  :	status[13]		Primary SDRAM size 32MB/64MB
 //  :	status[14]		Manual Reset
 //  :	status[20:15]  OSD options
+// 0123456789 ABCDEFGHIJKLMNO
 
 // Conditional modification of the CONF strings chaining according to chosen system type
 // Con Arc CD CDz
@@ -222,21 +223,28 @@ localparam CONF_STR = {
 	"H3OQ,ADPCMA,ON,OFF;",
 	"H3OR,ADPCMB,ON,OFF;",
 	"H3OS,PSG,ON,OFF;",
+	"H3oP,ADPCMA CH 1,ON,OFF;",
+	"H3oQ,ADPCMA CH 2,ON,OFF;",
+	"H3oR,ADPCMA CH 3,ON,OFF;",
+	"H3oS,ADPCMA CH 4,ON,OFF;",
+	"H3oT,ADPCMA CH 5,ON,OFF;",
+	"H3oU,ADPCMA CH 6,ON,OFF;",
 	"H3-;",
 	"O12,System Type,Console(AES),Arcade(MVS);", //,CD,CDZ;",
 	"OM,BIOS,UniBIOS,Original;",
 	"O3,Video Mode,NTSC,PAL;",
 	"-;",
 	"H0O4,Memory Card,Plugged,Unplugged;",
-	"RL,Load Memory Card;",
-	"RC,Save Memory Card;",
+	"RL,Reload Memory Card;",
+	"D4RC,Save Memory Card;",
+	"OO,Autosave,OFF,ON;",
 	"H1-;",
 	"H1OAB,Region,US,EU,JP,AS;",
 	"H1OF,CD lid,Opened,Closed;",
 	"H2-;",
-	"H2O7,DIP:Settings,OFF,ON;",
-	"H2O8,DIP:Freeplay,OFF,ON;",
-	"H2O9,DIP:Freeze,OFF,ON;",
+	"H2O7,[DIP] Settings,OFF,ON;",
+	"H2O8,[DIP] Freeplay,OFF,ON;",
+	"H2O9,[DIP] Freeze,OFF,ON;",
 	"-;",
 	"OG,Width,320px,304px;",
 	"OH,Aspect Ratio,Original,Wide;",
@@ -261,8 +269,7 @@ pll pll(
 	.refclk(CLK_50M),
 	.rst(0),
 	.outclk_0(clk_sys),
-	.outclk_1(SDRAM_CLK),	// Phase shifted
-	.outclk_2(SDRAM2_CLK),	// Phase shifted
+	.outclk_1(CLK_VIDEO),
 	.locked(locked)
 );
 
@@ -325,7 +332,7 @@ wire [15:0] joystick_1;
 wire  [1:0] buttons;
 wire [10:0] ps2_key;
 wire        forced_scandoubler;
-wire [31:0] status;
+wire [63:0] status;
 
 wire [64:0] rtc;
 
@@ -339,6 +346,7 @@ wire SYSTEM_MVS = (SYSTEM_TYPE == 2'd1);
 wire SYSTEM_CDx = SYSTEM_TYPE[1];
 
 wire [15:0] sdram_sz;
+wire [21:0] gamma_bus;
 
 hps_io #(.STRLEN($size(CONF_STR)>>3), .WIDE(1), .VDNUM(2)) hps_io
 (
@@ -353,11 +361,12 @@ hps_io #(.STRLEN($size(CONF_STR)>>3), .WIDE(1), .VDNUM(2)) hps_io
 	.ps2_key(ps2_key),
 
 	.status(status),				// status read (32 bits)
-	.status_menumask({status[22], 11'd0, ~dbg_menu,~SYSTEM_MVS,~SYSTEM_CDx,SYSTEM_CDx}),
+	.status_menumask({status[22], 10'd0, bk_autosave | ~bk_pending, ~dbg_menu,~SYSTEM_MVS,~SYSTEM_CDx,SYSTEM_CDx}),
 
 	.RTC(rtc),
 	.sdram_sz(sdram_sz),
-	
+	.gamma_bus(gamma_bus),
+
 	// Loading signals
 	.ioctl_wr(ioctl_wr),
 	.ioctl_addr(ioctl_addr),
@@ -529,26 +538,39 @@ end
 	wire downloading = status[0];
 	reg bk_rd, bk_wr;
 	reg bk_ena = 0;
-	//reg sav_pending = 0;
-	//wire bk_change = 0; // TODO
+	reg bk_pending = 0;
+
+	wire bk_autosave = status[24];
+	// Memory write flag for backup memory & memory card
+	// (~nBWL | ~nBWU) : [AES] Unibios (set to MVS) softdip settings, [MVS] cab settings, dates, timer, high scores, saves, & bookkeeeping
+	// CARD_WE         : [AES/MVS] game saves and high scores
+	wire bk_change = sram_slot_we | CARD_WE;
+	wire memcard_change;
+
+	reg sram_slot_we;
+	always @(posedge clk_sys) begin
+		sram_slot_we <= 0;
+		if(~nBWL | ~nBWU) begin
+			sram_slot_we <= (M68K_ADDR[15:1] >= 'h190 && M68K_ADDR[15:1] < 'h4190);
+		end
+	end
 
 	always @(posedge clk_sys) begin
 		reg old_downloading = 0;
-	//	reg old_change = 0;
 
 		old_downloading <= downloading;
 		if(~old_downloading & downloading) bk_ena <= 0;
 
-		//Save file always mounted in the end of downloading state.
+		// Save file always mounted in the end of downloading state.
 		if(downloading && img_mounted[0] && !img_readonly) bk_ena <= 1;
 
-	//	old_change <= bk_change;
-	//	if (~old_change & bk_change & ~OSD_STATUS) sav_pending <= status[13];
-	//	else if (bk_state) sav_pending <= 0;
+		// Determine whether file needs to be written
+		if (bk_change)     bk_pending <= 1;
+		else if (bk_state) bk_pending <= 0;
 	end
 
 	wire bk_load    = status[21];
-	wire bk_save    = status[12]; // | (sav_pending & OSD_STATUS);
+	wire bk_save    = status[12] | (bk_autosave & OSD_STATUS);
 	reg  bk_loading = 0;
 	reg  bk_state   = 0;
 
@@ -565,7 +587,7 @@ end
 		if(~old_ack & sd_ack) {bk_rd, bk_wr} <= 0;
 
 		if(!bk_state) begin
-			if(bk_ena & ((~old_load & bk_load) | (~old_save & bk_save))) begin
+			if(bk_ena & ((~old_load & bk_load) | (~old_save & bk_save & bk_pending))) begin
 				bk_state <= 1;
 				bk_loading <= bk_load;
 				sd_lba <= 0;
@@ -834,6 +856,7 @@ end
 	wire [63:0] sdram1_dout, sdram2_dout;
 
 	sdram ram1(
+		.SDRAM_CLK(SDRAM_CLK),
 		.SDRAM_CKE(SDRAM_CKE),
 		.SDRAM_A(SDRAM_A),
 		.SDRAM_BA(SDRAM_BA),
@@ -868,6 +891,7 @@ end
 
 `ifdef DUAL_SDRAM
 	sdram ram2(
+		.SDRAM_CLK(SDRAM2_CLK),
 		.SDRAM_A(SDRAM2_A),
 		.SDRAM_BA(SDRAM2_BA),
 		.SDRAM_DQ(SDRAM2_DQ),
@@ -906,6 +930,7 @@ end
 	assign sdr2_cprd = 0;
 	assign sdr2_cpbusy = 0;
 	assign sdr2_en = 0;
+	assign SDRAM2_CLK = 1'bZ;
 `endif
 
 	assign sdram_dout  = sdr_pri_sel ? sdram1_dout : sdram2_dout;
@@ -947,7 +972,7 @@ end
 	
 	cpu_68k M68KCPU(
 		.CLK_24M(CLK_24M),
-		.nRESET(nRESET),
+		.nRESET(nRESET_WD),
 		.M68K_ADDR(M68K_ADDR),
 		.FX68K_DATAIN(FX68K_DATAIN), .FX68K_DATAOUT(FX68K_DATAOUT),
 		.nLDS(nLDS), .nUDS(nUDS), .nAS(nAS), .M68K_RW(M68K_RW),
@@ -1050,7 +1075,7 @@ end
 	// Backup RAM
 	wire nBWL = nSRAMWEL | nSRAMWEN_G;
 	wire nBWU = nSRAMWEU | nSRAMWEN_G;
-	
+
 	wire [15:0] sd_buff_din_sram;
 	backup BACKUP(
 		.CLK_24M(CLK_24M),
@@ -1537,8 +1562,6 @@ end
 	end
 
 	wire [7:0] YM2610_DOUT;
-	wire signed [15:0] ym2610_l;
-	wire signed [15:0] ym2610_r;
 
 	jt10 YM2610(
 		.rst(~nRESET),
@@ -1549,36 +1572,8 @@ end
 		.irq_n(nZ80INT),
 		.adpcma_addr(ADPCMA_ADDR), .adpcma_bank(ADPCMA_BANK), .adpcma_roe_n(nSDROE), .adpcma_data(ADPCMA_DATA),
 		.adpcmb_addr(ADPCMB_ADDR), .adpcmb_roe_n(nSDPOE), .adpcmb_data(SYSTEM_CDx ? 8'h08 : ADPCMB_DATA),	// CD has no ADPCM-B
-		.snd_right(snd_right), .snd_left(snd_left), .snd_enable(~{4{dbg_menu}} | ~status[28:25])
-//		.snd_right(ym2610_r), .snd_left(ym2610_l), .snd_enable(~status[28:25])
+		.snd_right(snd_right), .snd_left(snd_left), .snd_enable(~{4{dbg_menu}} | ~status[28:25]), .ch_enable(~status[62:57])
 	);
-/*
-// Remove DC offset already signed
-jt49_dcrm2 #(.sw(16), .ins(1)) dc_filter_l (
-	.clk  (CLK_8M),
-	.cen  (filter_cnt==0),
-	.rst  (~nRESET),
-	.dins (ym2610_l),
-	.dout (snd_left)
-);
-
-jt49_dcrm2 #(.sw(16), .ins(1)) dc_filter_r (
-	.clk  (CLK_8M),
-	.cen  (filter_cnt==0),
-	.rst  (~nRESET),
-	.dins (ym2610_r),
-	.dout (snd_right)
-);
-
-// Filter CE impacts frequency response
-reg [16:0] filter_cnt;
-always_ff @(posedge CLK_8M) begin
-	filter_cnt<= filter_cnt + 1'b1;
-	if (filter_cnt == 16'b1000_1111_1111_1111) begin // divisible by 36
-		filter_cnt<= filter_cnt + 1'b1;
-	end
-end
-*/
 	
 	 
 	// For Neo CD only
@@ -1619,6 +1614,7 @@ end
 		.FIXMAP_ADDR(FIXMAP_ADDR)	// Extracted for NEO-CMC
 	);
 	
+	wire nRESET_WD;
 	neo_b1 B1(
 		.CLK(CLK_24M),	.CLK_6MB(CLK_6MB), .CLK_1HB(CLK_1HB),
 		.S1H1(S1H1),
@@ -1633,7 +1629,9 @@ end
 		.WE(WE), .CK(CK),
 		.TMS0(CHG), .LD1(LD1), .LD2(LD2), .SS1(SS1), .SS2(SS2),
 		.PA(PAL_RAM_ADDR),
-		.EN_FIX(FIX_EN)
+		.EN_FIX(FIX_EN),
+		.nRST(nRESET),
+		.nRESET(nRESET_WD)
 	);
 
 	spram #(13,16) PALRAM(
@@ -1648,7 +1646,7 @@ end
 	reg ce_pix;
 	reg [2:0] HBlank;
 	reg HBlank304;
-	always @(posedge clk_sys) begin
+	always @(posedge CLK_VIDEO) begin
 		reg old_clk;
 		reg [9:0] pxcnt;
 
@@ -1675,21 +1673,21 @@ end
 		reg [2:0] vbl;
 		reg [7:0] vblcnt, vspos;
 		
-		old_hs <= HSync;
-		if(~old_hs & HSync) begin
-			old_vbl <= nBNKB;
-			
-			if(~nBNKB) vblcnt <= vblcnt+1'd1;
-			if(old_vbl & ~nBNKB) vblcnt <= 0;
-			if(~old_vbl & nBNKB) vspos <= (vblcnt>>1) - 8'd7;
+		if(ce_pix) begin
+			old_hs <= HSync;
+			if(~old_hs & HSync) begin
+				old_vbl <= nBNKB;
+				
+				if(~nBNKB) vblcnt <= vblcnt+1'd1;
+				if(old_vbl & ~nBNKB) vblcnt <= 0;
+				if(~old_vbl & nBNKB) vspos <= (vblcnt>>1) - 8'd7;
 
-			{VSync,vbl} <= {vbl,1'b0};
-			if(vblcnt == vspos) {VSync,vbl} <= '1;
+				{VSync,vbl} <= {vbl,1'b0};
+				if(vblcnt == vspos) {VSync,vbl} <= '1;
+			end
 		end
 	end
 	
-
-	assign CLK_VIDEO = clk_sys;
 	assign VGA_SL = scale ? scale[1:0] - 1'd1 : 2'd0;
 	assign VGA_F1 = 0;
 
@@ -1707,7 +1705,7 @@ end
 	wire hs,vs,hblank,vblank;
 	video_cleaner video_cleaner
 	(
-		.clk_vid(clk_sys),
+		.clk_vid(CLK_VIDEO),
 		.ce_pix(ce_pix),
 
 		.R(~SHADOW ? R8 : {1'b0, R8[7:1]}),
@@ -1728,11 +1726,11 @@ end
 		.VBlank_out(vblank)
 	);
 	
-	video_mixer #(.LINE_LENGTH(320), .HALF_DEPTH(0)) video_mixer
+	video_mixer #(.LINE_LENGTH(320), .HALF_DEPTH(0), .GAMMA(1)) video_mixer
 	(
 		.*,
 
-		.clk_sys(CLK_VIDEO),
+		.clk_vid(CLK_VIDEO),
 		.ce_pix(ce_pix),
 		.ce_pix_out(CE_PIXEL),
 

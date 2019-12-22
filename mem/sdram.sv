@@ -42,6 +42,7 @@ module sdram
 	output            SDRAM_nRAS,  // row address select
 	output            SDRAM_nCAS,  // columns address select
 	output            SDRAM_CKE,   // clock enable
+	output            SDRAM_CLK,
 	input             SDRAM_EN,    // clock enable
 
 	input             sel,
@@ -111,12 +112,13 @@ localparam STATE_RFSH    = 11;
 
 
 always @(posedge clk) begin
-	reg [CAS_LATENCY+BURST_LENGTH-1:0] data_ready_delay;
+	reg [CAS_LATENCY+BURST_LENGTH:0] data_ready_delay;
 
 	reg        saved_wr;
 	reg        saved_burst;
 	reg [12:0] cas_addr;
 	reg [15:0] saved_data;
+	reg [15:0] dq_reg;
 	reg  [8:0] cpcnt;
 	reg        old_cpreq = 0;
 	reg  [3:0] state = STATE_STARTUP;
@@ -124,11 +126,12 @@ always @(posedge clk) begin
 	refresh_count <= refresh_count+1'b1;
 
 	data_ready_delay <= data_ready_delay>>1;
+	dq_reg <= SDRAM_DQ;
 
-	if(data_ready_delay[0]) dout[15:0]  <= SDRAM_DQ;
-	if(data_ready_delay[1]) dout[31:16] <= SDRAM_DQ;
-	if(data_ready_delay[2]) dout[47:32] <= SDRAM_DQ;
-	if(data_ready_delay[3]) dout[63:48] <= SDRAM_DQ;
+	if(data_ready_delay[0]) dout[15:0]  <= dq_reg;
+	if(data_ready_delay[1]) dout[31:16] <= dq_reg;
+	if(data_ready_delay[2]) dout[47:32] <= dq_reg;
+	if(data_ready_delay[3]) dout[63:48] <= dq_reg;
 
 	if(data_ready_delay[0] &  saved_burst) ready <= 1;
 	if(data_ready_delay[3] & ~saved_burst) ready <= 1;
@@ -268,7 +271,7 @@ always @(posedge clk) begin
 				end
 				else begin
 					command  <= CMD_READ;
-					data_ready_delay[CAS_LATENCY+BURST_LENGTH-1] <= 1;
+					data_ready_delay[CAS_LATENCY+BURST_LENGTH] <= 1;
 				end
 			end
 			
@@ -299,11 +302,36 @@ always @(posedge clk) begin
 		cpbusy <= 0;
 		cprd <= 0;
 		dout <= '0;
-		SDRAM_A <= 'Z;
-		SDRAM_BA <= 'Z;
-		command <= 'Z;
-		chip <= 'Z;
+		SDRAM_A <= 0;
+		SDRAM_BA <= 0;
+		command <= 0;
+		chip <= 0;
 	end
 end
 
+altddio_out
+#(
+	.extend_oe_disable("OFF"),
+	.intended_device_family("Cyclone V"),
+	.invert_output("OFF"),
+	.lpm_hint("UNUSED"),
+	.lpm_type("altddio_out"),
+	.oe_reg("UNREGISTERED"),
+	.power_up_high("OFF"),
+	.width(1)
+)
+sdramclk_ddr
+(
+	.datain_h(1'b0),
+	.datain_l(1'b1),
+	.outclock(clk),
+	.dataout(SDRAM_CLK),
+	.aclr(1'b0),
+	.aset(1'b0),
+	.oe(1'b1),
+	.outclocken(1'b1),
+	.sclr(1'b0),
+	.sset(1'b0)
+);
+ 
 endmodule
